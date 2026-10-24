@@ -1,5 +1,6 @@
 package com.streammultichat.platform.twitch
 
+import android.util.Log
 import com.streammultichat.core.chat.StreamConnector
 import com.streammultichat.core.model.ChatMessage
 import com.streammultichat.core.model.ConnectionStatus
@@ -23,11 +24,17 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 class TwitchConnector(
     private val client: OkHttpClient = NetworkClientProvider.defaultClient,
@@ -47,13 +54,17 @@ class TwitchConnector(
 
     private var activeWebSocket: WebSocket? = null
     private var reconnectJob: Job? = null
+    private var healthPollJob: Job? = null
     private var currentConfig: StreamChannelConfig? = null
     private var isUserDisconnect = false
     private val backoffPolicy = BackoffPolicy()
     private var reconnectAttempt = 0
 
     companion object {
+        private const val TAG = "TwitchConnector"
         private const val TWITCH_IRC_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
+        private const val TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 
     override suspend fun connect(config: StreamChannelConfig) {
@@ -61,16 +72,89 @@ class TwitchConnector(
         isUserDisconnect = false
         reconnectAttempt = 0
         establishWebSocketConnection(config)
+
+        healthPollJob?.cancel()
+        healthPollJob = scope.launch {
+            startHealthPolling(config.channelName)
+        }
     }
 
     override suspend fun disconnect() {
         isUserDisconnect = true
         reconnectJob?.cancel()
         reconnectJob = null
+        healthPollJob?.cancel()
+        healthPollJob = null
         activeWebSocket?.close(1000, "User requested disconnect")
         activeWebSocket = null
         _health.value = null
         _connectionStatus.value = ConnectionStatus.DISCONNECTED
+    }
+
+    private suspend fun startHealthPolling(channelName: String) {
+        val cleanChannel = channelName.trim().removePrefix("#").lowercase()
+        if (cleanChannel.isBlank()) return
+
+        while (scope.isActive && !isUserDisconnect) {
+            try {
+                pollTwitchStreamHealth(cleanChannel)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error polling Twitch stream health: ${e.message}")
+            }
+            delay(30_000L)
+        }
+    }
+
+    private suspend fun pollTwitchStreamHealth(cleanChannel: String) = withContext(Dispatchers.IO) {
+        try {
+            val queryJson = "{\"query\":\"query { user(login: \\\"$cleanChannel\\\") { stream { viewersCount createdAt title } } }\"}"
+            val request = Request.Builder()
+                .url("https://gql.twitch.tv/gql")
+                .header("Client-Id", TWITCH_GQL_CLIENT_ID)
+                .header("Content-Type", "application/json")
+                .post(queryJson.toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body?.string() ?: return@withContext
+                    val isLive = body.contains("\"stream\":{") && !body.contains("\"stream\":null")
+                    val viewers = Regex("\"viewersCount\":(\\d+)").find(body)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val title = Regex("\"title\":\"([^\"]+)\"").find(body)?.groupValues?.get(1)
+                    val createdAtStr = Regex("\"createdAt\":\"([^\"]+)\"").find(body)?.groupValues?.get(1)
+                    val startedAt = createdAtStr?.let { parseIsoTimestamp(it) }
+
+                    val health = StreamHealth(
+                        platform = PlatformType.TWITCH,
+                        isLive = isLive,
+                        viewerCount = viewers,
+                        startedAt = startedAt,
+                        title = title ?: if (isLive) "Directo en Twitch ($cleanChannel)" else "Canal sin directo activo (@$cleanChannel)",
+                        channelName = cleanChannel,
+                        previewUrl = "https://player.twitch.tv/?channel=$cleanChannel&parent=localhost&muted=false&autoplay=true"
+                    )
+                    _health.value = health
+                    _events.tryEmit(StreamEvent.HealthUpdate(health))
+                    Log.d(TAG, "Twitch stream health updated for $cleanChannel: isLive=$isLive, viewers=$viewers")
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun parseIsoTimestamp(isoString: String): Long? {
+        return try {
+            val clean = if (isoString.contains(".")) {
+                isoString.substringBefore(".")
+            } else {
+                isoString.substringBefore("+").substringBefore("Z")
+            }
+            val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            format.parse(clean)?.time
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun establishWebSocketConnection(config: StreamChannelConfig) {

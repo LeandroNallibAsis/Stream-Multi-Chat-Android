@@ -76,6 +76,7 @@ class KickConnector(
 
     private var activeWebSocket: WebSocket? = null
     private var reconnectJob: Job? = null
+    private var healthPollJob: Job? = null
     private var currentConfig: StreamChannelConfig? = null
     private var isUserDisconnect = false
     private val backoffPolicy = BackoffPolicy()
@@ -109,6 +110,8 @@ class KickConnector(
         isUserDisconnect = true
         reconnectJob?.cancel()
         reconnectJob = null
+        healthPollJob?.cancel()
+        healthPollJob = null
         activeWebSocket?.close(1000, "User requested disconnect")
         activeWebSocket = null
         _health.value = null
@@ -137,6 +140,11 @@ class KickConnector(
         resolvedChannelId = channelId
         resolvedChatroomId = chatroomId
         Log.d(TAG, "Resolved channelId: $channelId, chatroomId: $chatroomId")
+
+        healthPollJob?.cancel()
+        healthPollJob = scope.launch {
+            startHealthPolling(channelSlug)
+        }
 
         val clientId = UUID.randomUUID().toString()
 
@@ -197,6 +205,53 @@ class KickConnector(
             // Ignore & fallback
         }
         Pair(null, null)
+    }
+
+    private suspend fun startHealthPolling(channelSlug: String) {
+        while (scope.isActive && !isUserDisconnect) {
+            delay(30_000L)
+            try {
+                val request = Request.Builder()
+                    .url("https://kick.com/api/v2/channels/$channelSlug")
+                    .header("Accept", "application/json")
+                    .header("User-Agent", USER_AGENT)
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: return@use
+                        val channelInfo = json.decodeFromString<KickChannelInfo>(body)
+                        val ls = channelInfo.livestream
+                        val health = if (ls != null && ls.isLive) {
+                            StreamHealth(
+                                platform = PlatformType.KICK,
+                                isLive = true,
+                                viewerCount = ls.viewerCount,
+                                startedAt = _health.value?.startedAt ?: (System.currentTimeMillis() - 3600_000L),
+                                title = ls.sessionTitle,
+                                channelName = channelSlug,
+                                previewUrl = "https://player.kick.com/$channelSlug"
+                            )
+                        } else {
+                            StreamHealth(
+                                platform = PlatformType.KICK,
+                                isLive = false,
+                                viewerCount = 0L,
+                                startedAt = null,
+                                title = "Canal sin transmisión activa (@$channelSlug)",
+                                channelName = channelSlug,
+                                previewUrl = "https://player.kick.com/$channelSlug"
+                            )
+                        }
+                        _health.value = health
+                        _events.tryEmit(StreamEvent.HealthUpdate(health))
+                        Log.d(TAG, "Kick stream health updated for $channelSlug: isLive=${health.isLive}, viewers=${health.viewerCount}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error in Kick health polling: ${e.message}")
+            }
+        }
     }
 
     private suspend fun fetchRealtimeConnectionUrl(channelId: Long, channelSlug: String, clientId: String): String? =
