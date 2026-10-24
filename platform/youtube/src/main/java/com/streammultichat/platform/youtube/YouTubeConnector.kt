@@ -125,7 +125,8 @@ class YouTubeConnector(
         val videoId: String,
         val title: String?,
         val viewerCount: Long,
-        val startedAt: Long?
+        val startedAt: Long?,
+        val isLive: Boolean
     )
 
     private suspend fun CoroutineScope.startPollingLoop(config: StreamChannelConfig) {
@@ -142,53 +143,44 @@ class YouTubeConnector(
             Log.d(TAG, "Resolving YouTube metadata for: '$rawInput'")
             val targetUrl = resolveTargetUrl(rawInput)
             val metadata = fetchLiveMetadata(targetUrl)
-            if (metadata == null) {
-                Log.e(TAG, "Failed to resolve YouTube stream for '$rawInput'")
+
+            if (metadata == null || !metadata.isLive || metadata.videoId.isBlank()) {
+                Log.d(TAG, "Channel '$rawInput' has no active live stream right now. In waiting/offline mode.")
                 val offlineHealth = StreamHealth(
                     platform = PlatformType.YOUTUBE,
                     isLive = false,
                     viewerCount = 0L,
-                    title = "Canal sin transmisión en vivo activa (@$rawInput)",
+                    title = "Canal @${rawInput.removePrefix("@")} (En espera de directo)",
                     channelName = rawInput,
                     previewUrl = null
                 )
                 _health.value = offlineHealth
                 _events.tryEmit(StreamEvent.HealthUpdate(offlineHealth))
-                _connectionStatus.value = ConnectionStatus.ERROR
+                _connectionStatus.value = ConnectionStatus.CONNECTED
                 _events.tryEmit(
                     StreamEvent.StatusChanged(
                         PlatformType.YOUTUBE,
-                        ConnectionStatus.ERROR,
-                        "No se pudo encontrar transmisión en vivo para '$rawInput'"
+                        ConnectionStatus.CONNECTED,
+                        "Conectado a @${rawInput.removePrefix("@")} (esperando directo)"
                     )
                 )
-                reconnectAttempt++
-                val delayMs = backoffPolicy.calculateDelay(reconnectAttempt)
-                delay(delayMs)
+
+                // Poll every 25s to detect when user goes live
+                delay(25_000L)
                 continue
             }
 
             val videoId = metadata.videoId
-            Log.d(TAG, "YouTube video ID resolved: $videoId (viewers=${metadata.viewerCount}, startedAt=${metadata.startedAt}). Obtaining InnerTube session...")
+            Log.d(TAG, "YouTube live stream detected: $videoId (viewers=${metadata.viewerCount}). Obtaining InnerTube session...")
             val session = fetchLiveChatSession(videoId)
             if (session == null) {
-                Log.e(TAG, "Failed to obtain InnerTube live chat session for video: $videoId")
-                _connectionStatus.value = ConnectionStatus.ERROR
-                _events.tryEmit(
-                    StreamEvent.StatusChanged(
-                        PlatformType.YOUTUBE,
-                        ConnectionStatus.ERROR,
-                        "No se pudo inicializar el chat de YouTube"
-                    )
-                )
-                reconnectAttempt++
-                val delayMs = backoffPolicy.calculateDelay(reconnectAttempt)
-                delay(delayMs)
+                Log.w(TAG, "Failed to obtain InnerTube live chat session for video: $videoId. Retrying in 10s...")
+                delay(10_000L)
                 continue
             }
 
             val (apiKey, initialContinuation) = session
-            Log.d(TAG, "InnerTube live chat session ready. Polling chat...")
+            Log.i(TAG, "InnerTube live chat session ready for video: $videoId. Polling chat...")
             _connectionStatus.value = ConnectionStatus.CONNECTED
             _events.tryEmit(StreamEvent.StatusChanged(PlatformType.YOUTUBE, ConnectionStatus.CONNECTED))
             reconnectAttempt = 0
@@ -214,12 +206,12 @@ class YouTubeConnector(
                     val (nextContinuation, waitMs) = pollInnerTubeMessages(apiKey, continuation, rawInput)
                     continuation = nextContinuation
 
-                    // Refresh viewers and status periodically every 45s
-                    if (System.currentTimeMillis() - lastHealthRefreshMs > 45_000L) {
+                    // Refresh viewers and status periodically every 35s
+                    if (System.currentTimeMillis() - lastHealthRefreshMs > 35_000L) {
                         lastHealthRefreshMs = System.currentTimeMillis()
                         scope.launch {
                             val fresh = fetchLiveMetadata("https://www.youtube.com/watch?v=$videoId")
-                            if (fresh != null) {
+                            if (fresh != null && fresh.isLive) {
                                 currentMeta = fresh
                                 val updatedHealth = StreamHealth(
                                     platform = PlatformType.YOUTUBE,
@@ -236,7 +228,7 @@ class YouTubeConnector(
                         }
                     }
 
-                    val safeDelay = (waitMs ?: 2500L).coerceIn(1200L, 6000L)
+                    val safeDelay = (waitMs ?: 2500L).coerceIn(1200L, 5000L)
                     delay(safeDelay)
                 } catch (e: Exception) {
                     if (!isActive || isUserDisconnect) break
@@ -246,6 +238,8 @@ class YouTubeConnector(
                     _connectionStatus.value = ConnectionStatus.CONNECTED
                 }
             }
+
+            Log.i(TAG, "YouTube stream $videoId ended or disconnected. Re-checking channel...")
         }
     }
 
@@ -265,6 +259,9 @@ class YouTubeConnector(
                 val id = clean.substringAfter("/live/").substringBefore("?").substringBefore("&")
                 "https://www.youtube.com/watch?v=$id"
             }
+            clean.startsWith("UC") && clean.length == 24 -> {
+                "https://www.youtube.com/channel/$clean/live"
+            }
             else -> {
                 val handle = if (clean.startsWith("@")) clean else "@$clean"
                 "https://www.youtube.com/$handle/live"
@@ -277,16 +274,46 @@ class YouTubeConnector(
             val request = Request.Builder()
                 .url(targetUrl)
                 .header("User-Agent", USER_AGENT)
-                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: return@withContext null
 
-                // 1. Video ID
-                val videoId = Regex("\"videoId\":\"([a-zA-Z0-9_-]{11})\"").find(body)?.groupValues?.get(1)
-                    ?: Regex("/watch\\?v=([a-zA-Z0-9_-]{11})").find(targetUrl)?.groupValues?.get(1)
-                    ?: return@withContext null
+                // Determine canonical URL or video ID
+                val canonicalUrl = Regex("<link\\s+rel=[\"']canonical[\"']\\s+href=[\"']([^\"']+)[\"']").find(body)?.groupValues?.get(1)
+                    ?: Regex("\"canonicalUrl\":\"([^\"]+)\"").find(body)?.groupValues?.get(1)
+
+                val isChannelEndpoint = targetUrl.contains("/live") || targetUrl.contains("/@") || targetUrl.contains("/channel/")
+                val isCanonicalWatch = canonicalUrl != null && canonicalUrl.contains("watch?v=")
+
+                val videoId = if (isCanonicalWatch) {
+                    Regex("watch\\?v=([a-zA-Z0-9_-]{11})").find(canonicalUrl!!)?.groupValues?.get(1)
+                } else if (!isChannelEndpoint) {
+                    // Direct video or watch URL passed by user
+                    Regex("/watch\\?v=([a-zA-Z0-9_-]{11})").find(targetUrl)?.groupValues?.get(1)
+                        ?: Regex("\"videoId\":\"([a-zA-Z0-9_-]{11})\"").find(body)?.groupValues?.get(1)
+                } else {
+                    // Channel is offline (canonical URL is /channel/UC... or /@...)
+                    null
+                }
+
+                if (videoId.isNullOrBlank()) {
+                    // Channel is offline / no active live broadcast
+                    return@withContext YouTubeLiveMetadata(
+                        videoId = "",
+                        title = null,
+                        viewerCount = 0L,
+                        startedAt = null,
+                        isLive = false
+                    )
+                }
+
+                // Check if this video is truly live or upcoming/ended
+                val isLiveBadge = body.contains("\"isLive\":true") ||
+                                  body.contains("\"isLiveContent\":true") ||
+                                  body.contains("liveStreamability") ||
+                                  isCanonicalWatch
 
                 // 2. Title
                 val title = Regex("<title>(.+?)</title>").find(body)?.groupValues?.get(1)
@@ -295,6 +322,7 @@ class YouTubeConnector(
                 // 3. Viewers (concurrent live viewers)
                 val viewersRaw = Regex("\"originalViewCount\":\"(\\d+)\"").find(body)?.groupValues?.get(1)
                     ?: Regex("\"viewCount\":\\{\"videoViewCountRenderer\":\\{\"viewCount\":\\{\"runs\":\\[\\{\"text\":\"([0-9,.]+)\"\\}").find(body)?.groupValues?.get(1)
+                    ?: Regex("\"viewCountText\":\\{\"runs\":\\[\\{\"text\":\"([0-9,.]+)\"\\}").find(body)?.groupValues?.get(1)
                 val viewerCount = viewersRaw?.replace(",", "")?.replace(".", "")?.toLongOrNull() ?: 0L
 
                 // 4. Start Time (ISO-8601 to epoch millis)
@@ -306,7 +334,8 @@ class YouTubeConnector(
                     videoId = videoId,
                     title = title,
                     viewerCount = viewerCount,
-                    startedAt = startedAt
+                    startedAt = startedAt,
+                    isLive = isLiveBadge
                 )
             }
         } catch (e: Exception) {

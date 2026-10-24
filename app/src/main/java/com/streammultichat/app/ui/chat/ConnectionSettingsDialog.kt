@@ -282,7 +282,8 @@ fun ConnectionSettingsDialog(
                             OutlinedTextField(
                                 value = youtubeChannel,
                                 onValueChange = { youtubeChannel = it },
-                                label = { Text("ID de stream o video (ej: 0sfDth4lMLc)") },
+                                label = { Text("Canal o ID (ej: @Leanx-x o ID)") },
+                                placeholder = { Text("@usuario o ID de video") },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth()
                             )

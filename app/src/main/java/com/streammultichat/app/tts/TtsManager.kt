@@ -214,6 +214,13 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
         }
         if (!_isInitialized.value || !shouldSpeak) return
 
+        // Resynchronize pending counter if TTS is currently idle
+        val tts = textToSpeech
+        if (tts == null || !tts.isSpeaking) {
+            pendingQueue.set(0)
+            _isSpeaking.value = false
+        }
+
         // Prevent duplicate speech of the exact same message
         synchronized(spokenLock) {
             if (spokenMessageIds.containsKey(message.id)) {
@@ -227,9 +234,9 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
         }
 
         // Anti-backlog protection for high-frequency chat:
-        // If 2+ messages are already in queue, drop normal chat messages so speech doesn't lag
-        if (pendingQueue.get() >= 2 && !message.isHighlight) {
-            Log.d(TAG, "Dropping message '${message.authorName}' due to queue backlog (${pendingQueue.get()})")
+        // Only drop normal chat messages if the speech queue has a heavy backlog (> 6)
+        if (pendingQueue.get() > 6 && !message.isHighlight) {
+            Log.d(TAG, "Dropping message '${message.authorName}' due to heavy queue backlog (${pendingQueue.get()})")
             return
         }
 
