@@ -4,8 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioManager
-import android.media.RingtoneManager
-import android.media.ToneGenerator
 import android.os.Bundle
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
@@ -55,7 +53,6 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
 
     private var textToSpeech: TextToSpeech? = null
     private var engineAttemptIndex = 0
-    private var toneGenerator: ToneGenerator? = null
 
     // Priority ordered fallback list: system default, Google TTS, Samsung SMT
     private val candidateEngines = listOf(
@@ -65,32 +62,7 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
     )
 
     init {
-        try {
-            toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not initialize ToneGenerator on start", e)
-        }
         tryNextEngine()
-    }
-
-    fun playAlertChime() {
-        try {
-            var tg = toneGenerator
-            if (tg == null) {
-                tg = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-                toneGenerator = tg
-            }
-            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 220)
-        } catch (e: Exception) {
-            Log.w(TAG, "ToneGenerator play failed, trying system ringtone", e)
-            try {
-                val notificationUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-                val ringtone = RingtoneManager.getRingtone(context.applicationContext, notificationUri)
-                ringtone?.play()
-            } catch (ex: Exception) {
-                Log.e(TAG, "Could not play alert sound", ex)
-            }
-        }
     }
 
     private fun tryNextEngine() {
@@ -251,12 +223,7 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
             cleanText
         }
 
-        if (message.isHighlight) {
-            playAlertChime()
-            speakInternal(textToSpeak, preferences.ttsSpeechRate, preferences.ttsPitch, isPriority = true, flush = true)
-        } else {
-            speakInternal(textToSpeak, preferences.ttsSpeechRate, preferences.ttsPitch, isPriority = false, flush = false)
-        }
+        speakInternal(textToSpeak, preferences.ttsSpeechRate, preferences.ttsPitch, isPriority = message.isHighlight, flush = false)
     }
 
     fun speakNotification(notification: StreamNotification, preferences: UserPreferences) {
@@ -272,9 +239,6 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
             spokenMessageIds["chat-${notification.id}"] = true
             spokenMessageIds["bits-${notification.id}"] = true
         }
-
-        // Distinct alert chime precedes speech announcement
-        playAlertChime()
 
         val cleanUser = sanitizeForSpeech(notification.user, maxChars = 25)
         var cleanDesc = sanitizeForSpeech(notification.description, maxChars = preferences.ttsMaxChars)
@@ -300,8 +264,8 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
             NotificationType.CHANNEL_POINTS -> "¡Canje de puntos en ${notification.platform.displayName}! $cleanUser: $cleanDesc"
         }
 
-        // Donations/Alerts flush any queued normal messages and speak immediately
-        speakInternal(textToSpeak, preferences.ttsSpeechRate, preferences.ttsPitch, isPriority = true, flush = true)
+        // Voice alert queues smoothly without interrupting current speech
+        speakInternal(textToSpeak, preferences.ttsSpeechRate, preferences.ttsPitch, isPriority = true, flush = false)
     }
 
     fun speakTest(speechRate: Float, pitch: Float) {
@@ -324,7 +288,6 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
             tryNextEngine()
             return
         }
-        playAlertChime()
         stop()
         val testAlertPhrase = "¡Alerta de prueba en Twitch! Usuario Estrella donó 500 bits. ¡Muchas gracias por apoyar el stream!"
         speakInternal(testAlertPhrase, speechRate, pitch, isPriority = true, flush = true)
@@ -350,10 +313,6 @@ class TtsManager(private val context: Context) : TextToSpeech.OnInitListener {
             Log.w(TAG, "Error shutting down TTS", e)
         }
         textToSpeech = null
-        try {
-            toneGenerator?.release()
-            toneGenerator = null
-        } catch (_: Exception) {}
         _isInitialized.value = false
     }
 
