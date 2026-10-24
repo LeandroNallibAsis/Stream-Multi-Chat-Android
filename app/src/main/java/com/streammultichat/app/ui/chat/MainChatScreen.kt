@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LiveTv
@@ -58,6 +59,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FloatingActionButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -118,6 +120,7 @@ fun MainChatScreen(
 
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showOverflowMenu by remember { mutableStateOf(false) }
+    var showAboutHelpDialog by remember { mutableStateOf(false) }
 
     val streamHealth by viewModel.streamHealth.collectAsStateWithLifecycle()
 
@@ -334,6 +337,23 @@ fun MainChatScreen(
                                         viewModel.clearChat()
                                     }
                                 )
+
+                                HorizontalDivider()
+
+                                DropdownMenuItem(
+                                    text = { Text("Información y Guía") },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Default.Info,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showAboutHelpDialog = true
+                                    }
+                                )
                             }
                         }
                     },
@@ -530,6 +550,12 @@ fun MainChatScreen(
                 PlatformType.STARVIOS to starviosChannel
             ),
             onDismiss = { showPreviewDialog = false }
+        )
+    }
+
+    if (showAboutHelpDialog) {
+        AboutHelpDialog(
+            onDismiss = { showAboutHelpDialog = false }
         )
     }
 
